@@ -39,9 +39,10 @@ import errno
 import socket
 import ssl
 import urlparse
-import re
-
+import io
+import threading
 import OpenSSL
+import struct
 NetWorkIOError = (socket.error, ssl.SSLError, OpenSSL.SSL.Error, OSError)
 
 
@@ -86,10 +87,6 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
         If browser send localhost:xxx request to GAE_proxy,
         we forward it to localhost.
         """
-        host = self.headers.get('Host', '')
-        host_ip, _, port = host.rpartition(':')
-        http_client = simple_http_client.HTTP_client((host_ip, int(port)))
-
         request_headers = dict((k.title(), v) for k, v in self.headers.items())
         payload = b''
         if 'Content-Length' in request_headers:
@@ -100,23 +97,19 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
                 xlog.warn('forward_local read payload failed:%s', e)
                 return
 
-        self.parsed_url = urlparse.urlparse(self.path)
-        if len(self.parsed_url[4]):
-            path = '?'.join([self.parsed_url[2], self.parsed_url[4]])
-        else:
-            path = self.parsed_url[2]
-        content, status, response = http_client.request(self.command, path, request_headers, payload)
-        if not status:
-            xlog.warn("forward_local fail")
+        response = simple_http_client.request(self.command, self.path, request_headers, payload)
+        if not response:
+            xlog.warn("forward_local fail, command:%s, path:%s, headers: %s, payload: %s",
+                self.command, self.path, request_headers, payload)
             return
 
         out_list = []
-        out_list.append("HTTP/1.1 %d\r\n" % status)
-        for key, value in response.getheaders():
+        out_list.append("HTTP/1.1 %d\r\n" % response.status)
+        for key in response.headers:
             key = key.title()
-            out_list.append("%s: %s\r\n" % (key, value))
+            out_list.append("%s: %s\r\n" % (key, response.headers[key]))
         out_list.append("\r\n")
-        out_list.append(content)
+        out_list.append(response.text)
 
         self.wfile.write("".join(out_list))
 
@@ -164,7 +157,17 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
                     or s in self.local_names:
                 print s
                 return True
-        return False
+
+            for h in config.PROXY_HOSTS_ONLY:
+                # if PROXY_HOSTS_ONLY is not empty
+                # only proxy these hosts
+                if s.endswith(h):
+                    return False
+
+        if len(config.PROXY_HOSTS_ONLY) > 0:
+            return True
+        else:
+            return False
 
     def do_METHOD(self):
         touch_active()
@@ -265,7 +268,7 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
         gae_handler.handler(self.command, self.path, request_headers, payload, self.wfile)
 
     def do_CONNECT(self):
-        if self.path != "https://www.twitter.com/xxnet":
+        if self.path != "www.twitter.com:443":
             touch_active()
 
         host, _, port = self.path.rpartition(':')
@@ -293,7 +296,7 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
         self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
 
         try:
-            ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
+            ssl_sock = ssl.wrap_socket(self.connection, keyfile=CertUtil.cert_keyfile, certfile=certfile, server_side=True)
         except ssl.SSLError as e:
             xlog.info('ssl error: %s, create full domain cert for host:%s', e, host)
             certfile = CertUtil.get_cert(host, full_name=True)
@@ -325,10 +328,10 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
             if not self.parse_request():
                 xlog.warn("parse request fail:%s", self.raw_requestline)
                 return
-        except NetWorkIOError as e:
-            if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET, errno.EPIPE):
-                xlog.exception('ssl.wrap_socket(self.connection=%r) failed: %s path:%s, errno:%s', self.connection, e, self.path, e.args[0])
-                raise
+        except Exception as e:
+            xlog.warn('ssl.wrap_socket(self.connection=%r) failed: %s path:%s, errno:%s', self.connection, e, self.path, e.args[0])
+            return
+
         if self.path[0] == '/' and host:
             self.path = 'https://%s%s' % (self.headers['Host'], self.path)
 
@@ -375,7 +378,7 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
         self.wfile.write(b'HTTP/1.1 200 OK\r\n\r\n')
 
         try:
-            ssl_sock = ssl.wrap_socket(self.connection, keyfile=certfile, certfile=certfile, server_side=True)
+            ssl_sock = ssl.wrap_socket(self.connection, keyfile=CertUtil.cert_keyfile, certfile=certfile, server_side=True)
         except ssl.SSLError as e:
             xlog.info('ssl error: %s, create full domain cert for host:%s', e, host)
             certfile = CertUtil.get_cert(host, full_name=True)
@@ -451,3 +454,74 @@ class GAEProxyHandler(simple_http_server.HttpServerHandler):
                     pass
                 finally:
                     self.__realconnection = None
+
+
+def is_clienthello(data):
+    if len(data) < 20:
+        return False
+    if data.startswith('\x16\x03'):
+        # TLSv12/TLSv11/TLSv1/SSLv3
+        length, = struct.unpack('>h', data[3:5])
+        return len(data) == 5 + length
+    elif data[0] == '\x80' and data[2:4] == '\x01\x03':
+        # SSLv23
+        return len(data) == 2 + ord(data[1])
+    else:
+        return False
+
+
+def extract_sni_name(packet):
+    if not packet.startswith('\x16\x03'):
+        return
+
+    stream = io.BytesIO(packet)
+    stream.read(0x2b)
+    session_id_length = ord(stream.read(1))
+    stream.read(session_id_length)
+    cipher_suites_length, = struct.unpack('>h', stream.read(2))
+    stream.read(cipher_suites_length+2)
+    extensions_length, = struct.unpack('>h', stream.read(2))
+    # extensions = {}
+    while True:
+        data = stream.read(2)
+        if not data:
+            break
+        etype, = struct.unpack('>h', data)
+        elen, = struct.unpack('>h', stream.read(2))
+        edata = stream.read(elen)
+        if etype == 0:
+            server_name = edata[5:]
+            return server_name
+
+
+def redirect_handler(sock, host, port, client_address):
+    leadbyte = sock.recv(1, socket.MSG_PEEK)
+    if leadbyte in ('\x80', '\x16'):
+        server_name = ''
+        if leadbyte == '\x16':
+            for _ in xrange(2):
+                leaddata = sock.recv(1024, socket.MSG_PEEK)
+                if is_clienthello(leaddata):
+                    try:
+                        server_name = extract_sni_name(leaddata)
+                    finally:
+                        break
+        try:
+            certfile = CertUtil.get_cert(server_name or 'www.google.com')
+            ssl_sock = ssl.wrap_socket(sock, keyfile=CertUtil.cert_keyfile,
+                                       certfile=certfile, server_side=True)
+        except StandardError as e:
+            if e.args[0] not in (errno.ECONNABORTED, errno.ECONNRESET):
+                xlog.exception('redirect_handler wrap_socket from:%s to:%s:%d sni:%s failed:%r',
+                               client_address, host, port, server_name, e)
+            return
+    elif leadbyte in ["G", "P", "D", "O", "H", "T"]:
+        ssl_sock = sock
+    else:
+        xlog.warn("redirect_handler lead byte:%s", leadbyte)
+        return
+
+    handler = GAEProxyHandler(ssl_sock, client_address, None, logger=xlog)
+    xlog.debug('redirect_handler from:%s to:%s:%d', client_address, host, port)
+    client_thread = threading.Thread(target=handler.handle)
+    client_thread.start()

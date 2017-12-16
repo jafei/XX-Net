@@ -6,7 +6,15 @@ sub_menus: {
     url: config
   },
   2:{
+    title: {{ _( "Status" ) }},
+    url: status
+  },
+  3:{
     title: {{ _("Log") }},
     url: logging
+  },
+  4:{
+    title: {{ _("Cloudflare Front Log") }},
+    url: cloudflare_front_logging
   }
 }

@@ -23,8 +23,6 @@
 </script>
 <script type="text/javascript">
     function doImportAction(ipList) {
-        ipList = conversionFormat('3', '1', ipList);
-        console.log('尝试导入 ', ipList.split('|').length, ' 个IP.');
 
         var postData = {
             'ipList': ipList
@@ -36,63 +34,11 @@
             data: postData,
             dataType: 'JSON',
             success: function(result) {
-                tip('成功导入' + result['res'] + '个IP.', 'success');
+                tip('Success import ' + result['res'] + ' IP.', 'success');
             },
             error: function() {
-                tip('导入IP失败');
+                tip('Import IP fail');
             }
         });
-    }
-</script>
-<script type="text/javascript">
-    function conversionFormat(originalFormat, targetFormat, sourceData) {
-        if( originalFormat == targetFormat ) {
-            return sourceData;
-        }
-
-        var ipList;
-        switch(originalFormat) { //由源数据转换为中间格式
-        case '1': //IP|IP|IP
-            ipList = sourceData.split("|");
-            break;
-        case '2': //换行分割
-            ipList = sourceData.split("\n");
-            break;
-        case '3': //智能正则匹配
-            var tmp = ' ' + sourceData;
-            var regex = /(?!\d)[^\d](([1-9]?\d|1\d{2}|2[0-4]\d|25[0-5])(\.([1-9]?\d|1\d{2}|2[0-4]\d|25[0-5])){3}(?!\d))/gm;
-
-            var regexResult;
-            ipList = [];
-            while(true) {
-                regexResult = regex.exec(tmp);
-
-                if(regexResult === null) {
-                    break;
-                }
-
-                ipList.push(regexResult[1]);
-            }
-            break;
-        }
-
-        var result;
-        switch(targetFormat) { //由中间格式转换为目标格式
-        case '1': //IP|IP|IP
-            result = '';
-            for(var id in ipList) {
-                result += ipList[id] + '|';
-            }
-            result = result.substr(0, result.length - 1);
-            break;
-        case '2': //换行分割
-            result = '';
-            for(var id in ipList) {
-                result += ipList[id] + '\n';
-            }
-            break;
-        }
-
-        return result;
     }
 </script>

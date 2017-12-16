@@ -21,17 +21,65 @@ root_path = os.path.abspath(os.path.join(current_path, os.pardir))
 import yaml
 import json
 
-from instances import xlog
+from xlog import getLogger
+xlog = getLogger("launcher")
 import module_init
 import config
 import autorun
+import update
 import update_from_github
+import simple_http_client
 import simple_http_server
 from simple_i18n import SimpleI18N
 
 NetWorkIOError = (socket.error, ssl.SSLError, OSError)
 
 i18n_translator = SimpleI18N(config.get(['language'], None))
+
+
+def test_proxy(type, host, port, user, passwd):
+    if not host:
+        return False
+
+    if host == "127.0.0.1":
+        if port in [8087, 1080]:
+            xlog.warn("set LAN Proxy to %s:%d fail.", host, port)
+            return False
+
+    client = simple_http_client.Client(proxy={
+        "type": type,
+        "host": host,
+        "port": int(port),
+        "user": user if len(user) else None,
+        "pass": passwd if len(passwd) else None
+    }, timeout=5)
+
+    urls = [
+        "https://www.microsoft.com",
+        "https://www.apple.com",
+        "https://code.jquery.com",
+        "https://cdn.bootcss.com",
+        "https://cdnjs.cloudflare.com"]
+
+    for url in urls:
+
+        header = {
+            "user-agent": "Mozilla/5.0 (Windows NT 6.1; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Safari/537.36",
+            "accept": "application/json, text/javascript, */*; q=0.01",
+            "accept-encoding": "gzip, deflate, sdch",
+            "accept-language": 'en-US,en;q=0.8,ja;q=0.6,zh-CN;q=0.4,zh;q=0.2',
+            "connection": "keep-alive"
+        }
+        try:
+            response = client.request("HEAD", url, header, "")
+            if response:
+                return True
+        except Exception as e:
+            xlog.exception("test_proxy %s fail:%r", url, e)
+            pass
+
+    return False
+
 
 module_menus = {}
 class Http_Handler(simple_http_server.HttpServerHandler):
@@ -57,7 +105,8 @@ class Http_Handler(simple_http_server.HttpServerHandler):
             module_menu = yaml.load(stream)
             new_module_menus[module] = module_menu
 
-        module_menus = sorted(new_module_menus.iteritems(), key=lambda (k,v): (v['menu_sort_id']))
+        module_menus = sorted(new_module_menus.iteritems(),
+                              key=lambda k_and_v: (k_and_v[1]['menu_sort_id']))
         #for k,v in self.module_menus:
         #    xlog.debug("m:%s id:%d", k, v['menu_sort_id'])
 
@@ -135,7 +184,6 @@ class Http_Handler(simple_http_server.HttpServerHandler):
         else:
             file_path = os.path.join(current_path, 'web_ui' + url_path)
 
-        xlog.debug ('launcher web_control %s %s %s ', self.address_string(), self.command, self.path)
         if os.path.isfile(file_path):
             if file_path.endswith('.js'):
                 mimetype = 'application/javascript'
@@ -150,22 +198,26 @@ class Http_Handler(simple_http_server.HttpServerHandler):
             else:
                 mimetype = 'text/plain'
             self.send_file(file_path, mimetype)
-        elif url_path == '/config':
-            self.req_config_handler()
-        elif url_path == '/update':
-            self.req_update_handler()
-        elif url_path == '/init_module':
-            self.req_init_module_handler()
-        elif url_path == '/quit':
-            self.send_response('text/html', '{"status":"success"}')
-            module_init.stop_all()
-            os._exit(0)
-        elif url_path == '/restart':
-            self.send_response('text/html', '{"status":"success"}')
-            update_from_github.restart_xxnet()
         else:
-            self.send_not_found()
-            xlog.info('%s "%s %s HTTP/1.1" 404 -', self.address_string(), self.command, self.path)
+            xlog.debug('launcher web_control %s %s %s ', self.address_string(), self.command, self.path)
+            if url_path == '/config':
+                self.req_config_handler()
+            elif url_path == '/update':
+                self.req_update_handler()
+            elif url_path == '/config_proxy':
+                self.req_config_proxy_handler()
+            elif url_path == '/init_module':
+                self.req_init_module_handler()
+            elif url_path == '/quit':
+                self.send_response('text/html', '{"status":"success"}')
+                module_init.stop_all()
+                os._exit(0)
+            elif url_path == '/restart':
+                self.send_response('text/html', '{"status":"success"}')
+                update_from_github.restart_xxnet()
+            else:
+                self.send_not_found()
+                xlog.info('%s "%s %s HTTP/1.1" 404 -', self.address_string(), self.command, self.path)
 
     def req_index_handler(self):
         req = urlparse.urlparse(self.path).query
@@ -178,6 +230,9 @@ class Http_Handler(simple_http_server.HttpServerHandler):
             if config.get(['modules', 'gae_proxy', 'auto_start'], 0) == 1:
                 target_module = 'gae_proxy'
                 target_menu = 'status'
+            elif config.get(['modules', 'x_tunnel', 'auto_start'], 0) == 1:
+                target_module = 'x_tunnel'
+                target_menu = 'config'
             else:
                 target_module = 'launcher'
                 target_menu = 'about'
@@ -224,14 +279,11 @@ class Http_Handler(simple_http_server.HttpServerHandler):
 
         if reqs['cmd'] == ['get_config']:
             config.load()
-            check_update = config.get(["update", "check_update"], 1)
-            if check_update == 0:
-                check_update = "dont-check"
-            elif check_update == 1:
-                check_update = "stable"
+            check_update = config.get(["update", "check_update"], "notice-stable")
 
             data = '{ "check_update": "%s", "language": "%s", "popup_webui": %d, "allow_remote_connect": %d, \
-             "show_systray": %d, "auto_start": %d, "show_detail": %d, "gae_proxy_enable": %d, "x_tunnel_enable": %d}' %\
+             "show_systray": %d, "auto_start": %d, "show_detail": %d, "gae_proxy_enable": %d, "x_tunnel_enable": %d, \
+             "smart_router_enable": %d, "no_mess_system": %d }' %\
                    (check_update
                     , config.get(["language"], i18n_translator.lang)
                     , config.get(["modules", "launcher", "popup_webui"], 1)
@@ -241,15 +293,33 @@ class Http_Handler(simple_http_server.HttpServerHandler):
                     , config.get(["modules", "gae_proxy", "show_detail"], 0)
                     , config.get(["modules", "gae_proxy", "auto_start"], 0)
                     , config.get(["modules", "x_tunnel", "auto_start"], 0)
+                    , config.get(["modules", "smart_router", "auto_start"], 0)
+                    , config.get(["no_mess_system"], 0)
                     )
+        if reqs['cmd'] == ['get_version']:
+            current_version = update_from_github.current_version()
+            data = '{"current_version":"%s"}' % (current_version)
         elif reqs['cmd'] == ['set_config']:
-            if 'check_update' in reqs:
+            if 'skip_version' in reqs:
+                skip_version = reqs['skip_version'][0]
+                skip_version_type = reqs['skip_version_type'][0]
+                if skip_version_type not in ["stable", "test"]:
+                    data = '{"res":"fail"}'
+                else:
+                    config.set(["update", "skip_%s_version" % skip_version_type], skip_version)
+                    config.save()
+                    if skip_version in update_from_github.update_info:
+                        update_from_github.update_info = ''
+                    data = '{"res":"success"}'
+            elif 'check_update' in reqs:
                 check_update = reqs['check_update'][0]
-                if check_update not in ["dont-check", "stable", "test"]:
+                if check_update not in ["dont-check", "stable", "notice-stable", "test", "notice-test"]:
                     data = '{"res":"fail, check_update:%s"}' % check_update
                 else:
-                    config.set(["update", "check_update"], check_update)
-                    config.save()
+                    if config.get(["update", "check_update"]) != check_update:
+                        update_from_github.init_update_info(check_update)
+                        config.set(["update", "check_update"], check_update)
+                        config.save()
 
                     data = '{"res":"success"}'
 
@@ -299,6 +369,16 @@ class Http_Handler(simple_http_server.HttpServerHandler):
                     data = '{"res":"fail, show_systray:%s"}' % show_systray
                 else:
                     config.set(["modules", "launcher", "show_systray"], show_systray)
+                    config.save()
+
+                    data = '{"res":"success"}'
+
+            elif 'no_mess_system' in reqs:
+                no_mess_system = int(reqs['no_mess_system'][0])
+                if no_mess_system != 0 and no_mess_system != 1:
+                    data = '{"res":"fail, show_systray:%s"}' % no_mess_system
+                else:
+                    config.set(["no_mess_system"], no_mess_system)
                     config.save()
 
                     data = '{"res":"success"}'
@@ -354,6 +434,19 @@ class Http_Handler(simple_http_server.HttpServerHandler):
                         module_init.stop("x_tunnel")
                     self.load_module_menus()
                     data = '{"res":"success"}'
+            elif 'smart_router_enable' in reqs :
+                smart_router_enable = int(reqs['smart_router_enable'][0])
+                if smart_router_enable != 0 and smart_router_enable != 1:
+                    data = '{"res":"fail, smart_router_enable:%s"}' % smart_router_enable
+                else:
+                    config.set(["modules", "smart_router", "auto_start"], smart_router_enable)
+                    config.save()
+                    if smart_router_enable:
+                        module_init.start("smart_router")
+                    else:
+                        module_init.stop("smart_router")
+                    self.load_module_menus()
+                    data = '{"res":"success"}'
             else:
                 data = '{"res":"fail"}'
 
@@ -364,7 +457,18 @@ class Http_Handler(simple_http_server.HttpServerHandler):
         reqs = urlparse.parse_qs(req, keep_blank_values=True)
         data = ''
 
-        if reqs['cmd'] == ['get_progress']:
+        if reqs['cmd'] == ['get_info']:
+            data = update_from_github.update_info
+            if data == '' or data[0] != '{':
+                data = '{"type":"%s"}' % data
+        elif reqs['cmd'] == ['set_info']:
+            update_from_github.update_info = reqs['info'][0]
+            data = '{"res":"success"}'
+        elif reqs['cmd'] == ['start_check']:
+            update_from_github.init_update_info(reqs['check_update'][0])
+            update.check_update()
+            data = '{"res":"success"}'
+        elif reqs['cmd'] == ['get_progress']:
             data = json.dumps(update_from_github.progress)
         elif reqs['cmd'] == ['get_new_version']:
             current_version = update_from_github.current_version()
@@ -373,7 +477,66 @@ class Http_Handler(simple_http_server.HttpServerHandler):
             xlog.info("%s", data)
         elif reqs['cmd'] == ['update_version']:
             version = reqs['version'][0]
-            update_from_github.start_update_version(version)
+
+            checkhash = 1
+            if 'checkhash' in reqs and reqs['checkhash'][0] == '0':
+                checkhash = 0
+
+            update_from_github.start_update_version(version, checkhash)
+            data = '{"res":"success"}'
+        elif reqs['cmd'] == ['set_localversion']:
+            version = reqs['version'][0]
+
+            if update_from_github.update_current_version(version):
+                data = '{"res":"success"}'
+            else:
+                data = '{"res":"false", "reason": "version not exist"}'
+
+        self.send_response('text/html', data)
+
+    def req_config_proxy_handler(self):
+        req = urlparse.urlparse(self.path).query
+        reqs = urlparse.parse_qs(req, keep_blank_values=True)
+        data = ''
+
+        if reqs['cmd'] == ['get_config']:
+            data = {
+                "enable": config.get(["proxy", "enable"], 0),
+                "type": config.get(["proxy", "type"], "HTTP"),
+                "host": config.get(["proxy", "host"], ""),
+                "port": config.get(["proxy", "port"], 8080),
+                "user": config.get(["proxy", "user"], ""),
+                "passwd": config.get(["proxy", "passwd"], ""),
+            }
+            data = json.dumps(data)
+        elif reqs['cmd'] == ['set_config']:
+            enable = reqs['enable'][0]
+            type = reqs['type'][0]
+            host = reqs['host'][0]
+            port = reqs['port'][0]
+            user = reqs['user'][0]
+            passwd = reqs['passwd'][0]
+
+            if int(enable) and not test_proxy(type, host, port, user, passwd):
+                return self.send_response('text/html', '{"res":"fail", "reason": "test proxy fail"}')
+
+            config.set(["proxy", "enable"], enable)
+            config.set(["proxy", "type"], type)
+            config.set(["proxy", "host"], host)
+            config.set(["proxy", "port"], port)
+            config.set(["proxy", "user"], user)
+            config.set(["proxy", "passwd"], passwd)
+            config.save()
+
+            module_init.call_each_module("set_proxy", {
+                "enable": enable,
+                "type": type,
+                "host": host,
+                "port": port,
+                "user": user,
+                "passwd": passwd
+            })
+
             data = '{"res":"success"}'
         self.send_response('text/html', data)
 
@@ -453,15 +616,15 @@ def confirm_xxnet_exit():
     is_xxnet_exit = False
     xlog.debug("start confirm_xxnet_exit")
 
-    for i in range(30):
-        # gae_proxy(default port:8087)
-        if http_request("http://127.0.0.1:8087/quit") == False:
-            xlog.debug("good, xxnet:8087 cleared!")
-            is_xxnet_exit = True
-            break
-        else:
-            xlog.debug("<%d>: try to terminate xxnet:8087" % i)
-        time.sleep(1)
+    #for i in range(30):
+    #    # gae_proxy(default port:8087)
+    #    if http_request("http://127.0.0.1:8087/quit") == False:
+    #        xlog.debug("good, xxnet:8087 cleared!")
+    #        is_xxnet_exit = True
+    #        break
+    #    else:
+    #        xlog.debug("<%d>: try to terminate xxnet:8087" % i)
+    #    time.sleep(1)
 
 
     for i in range(30):

@@ -21,9 +21,11 @@ import module_init
 import subprocess
 import webbrowser
 
+from xlog import getLogger
+xlog = getLogger("launcher")
+
 import AppKit
 import SystemConfiguration
-from instances import xlog
 from PyObjCTools import AppHelper
 
 class MacTrayObject(AppKit.NSObject):
@@ -76,6 +78,12 @@ class MacTrayObject(AppKit.NSObject):
         self.menu.addItem_(menuitem)
         self.globalGaeProxyMenuItem = menuitem
 
+        menuitem = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_('Enable Global X-Tunnel', 'enableGlobalXTunnel:', '')
+        if proxyState == 'xtunnel':
+            menuitem.setState_(AppKit.NSOnState)
+        self.menu.addItem_(menuitem)
+        self.globalXTunnelMenuItem = menuitem
+
         menuitem = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_('Disable GAEProxy', 'disableProxy:', '')
         if proxyState == 'disable':
             menuitem.setState_(AppKit.NSOnState)
@@ -83,7 +91,7 @@ class MacTrayObject(AppKit.NSObject):
         self.disableGaeProxyMenuItem = menuitem
 
         # Reset Menu Item
-        menuitem = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_('Reload GAEProxy', 'resetGoagent:', '')
+        menuitem = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_('Reset Each Module', 'restartEachModule:', '')
         self.menu.addItem_(menuitem)
         # Default event
         menuitem = AppKit.NSMenuItem.alloc().initWithTitle_action_keyEquivalent_('Quit', 'windowWillClose:', '')
@@ -100,6 +108,7 @@ class MacTrayObject(AppKit.NSObject):
         # Remove Tick before All Menu Items
         self.autoGaeProxyMenuItem.setState_(AppKit.NSOffState)
         self.globalGaeProxyMenuItem.setState_(AppKit.NSOffState)
+        self.globalXTunnelMenuItem.setState_(AppKit.NSOffState)
         self.disableGaeProxyMenuItem.setState_(AppKit.NSOffState)
 
         # Get current selected mode
@@ -110,6 +119,8 @@ class MacTrayObject(AppKit.NSObject):
             self.autoGaeProxyMenuItem.setState_(AppKit.NSOnState)
         elif proxyState == 'gae':
             self.globalGaeProxyMenuItem.setState_(AppKit.NSOnState)
+        elif proxyState == 'xtunnel':
+            self.globalXTunnelMenuItem.setState_(AppKit.NSOnState)
         elif proxyState == 'disable':
             self.disableGaeProxyMenuItem.setState_(AppKit.NSOnState)
 
@@ -119,6 +130,7 @@ class MacTrayObject(AppKit.NSObject):
     def validateMenuItem_(self, menuItem):
         return currentService or (menuItem != self.autoGaeProxyMenuItem and
                                   menuItem != self.globalGaeProxyMenuItem and
+                                  menuItem != self.globalXTunnelMenuItem and
                                   menuItem != self.disableGaeProxyMenuItem)
 
     def presentAlert_withTitle_(self, msg, title):
@@ -162,9 +174,9 @@ class MacTrayObject(AppKit.NSObject):
         host_port = config.get(["modules", "launcher", "control_port"], 8085)
         webbrowser.open_new("http://127.0.0.1:%s/" % host_port)
 
-    def resetGoagent_(self, _):
-        module_init.stop("gae_proxy")
-        module_init.start("gae_proxy")
+    def restartEachModule_(self, _):
+        module_init.stop_all()
+        module_init.start_all_auto()
 
     def enableAutoProxy_(self, _):
         try:
@@ -193,6 +205,21 @@ class MacTrayObject(AppKit.NSObject):
             xlog.info("try enable global proxy:%s", executeCommand)
             subprocess.call(['osascript', '-e', executeCommand])
         config.set(["modules", "launcher", "proxy"], "gae")
+        config.save()
+        self.updateStatusBarMenu()
+
+    def enableGlobalXTunnel_(self, _):
+        try:
+            helperDisableAutoProxy(currentService)
+            helperEnableXTunnelProxy(currentService)
+        except:
+            disableAutoProxyCommand   = getDisableAutoProxyCommand(currentService)
+            enableXTunnelProxyCommand  = getEnableXTunnelProxyCommand(currentService)
+            executeCommand            = 'do shell script "%s;%s" with administrator privileges' % (disableAutoProxyCommand, enableXTunnelProxyCommand)
+
+            xlog.info("try enable global x-tunnel proxy:%s", executeCommand)
+            subprocess.call(['osascript', '-e', executeCommand])
+        config.set(["modules", "launcher", "proxy"], "xtunnel")
         config.save()
         self.updateStatusBarMenu()
 
@@ -246,6 +273,11 @@ def getProxyState(service):
     if ( executeResult.find('Enabled: Yes\nServer: 127.0.0.1\nPort: 8087') != -1 ):
         return "gae"
 
+    # Check if global proxy is enabled
+    executeResult = subprocess.check_output(['networksetup', '-getwebproxy', service])
+    if ( executeResult.find('Enabled: Yes\nServer: 127.0.0.1\nPort: 1080') != -1 ):
+        return "xtunnel"
+
     return "disable"
 
 # Generate commands for Apple Script
@@ -258,6 +290,11 @@ def getDisableAutoProxyCommand(service):
 def getEnableGlobalProxyCommand(service):
     enableHttpProxyCommand   = "networksetup -setwebproxy \\\"%s\\\" 127.0.0.1 8087" % service
     enableHttpsProxyCommand  = "networksetup -setsecurewebproxy \\\"%s\\\" 127.0.0.1 8087" % service
+    return "%s;%s" % (enableHttpProxyCommand, enableHttpsProxyCommand)
+
+def getEnableXTunnelProxyCommand(service):
+    enableHttpProxyCommand   = "networksetup -setwebproxy \\\"%s\\\" 127.0.0.1 1080" % service
+    enableHttpsProxyCommand  = "networksetup -setsecurewebproxy \\\"%s\\\" 127.0.0.1 1080" % service
     return "%s;%s" % (enableHttpProxyCommand, enableHttpsProxyCommand)
 
 def getDisableGlobalProxyCommand(service):
@@ -276,6 +313,10 @@ def helperEnableGlobalProxy(service):
     subprocess.check_call([helper_path, 'enablehttp', service, '127.0.0.1', '8087'])
     subprocess.check_call([helper_path, 'enablehttps', service, '127.0.0.1', '8087'])
 
+def helperEnableXTunnelProxy(service):
+    subprocess.check_call([helper_path, 'enablehttp', service, '127.0.0.1', '1080'])
+    subprocess.check_call([helper_path, 'enablehttps', service, '127.0.0.1', '1080'])
+
 def helperDisableGlobalProxy(service):
     subprocess.check_call([helper_path, 'disablehttp', service])
     subprocess.check_call([helper_path, 'disablehttps', service])
@@ -293,6 +334,9 @@ def loadConfig():
         elif proxy_setting == "gae":
             helperDisableAutoProxy(currentService)
             helperEnableGlobalProxy(currentService)
+        elif proxy_setting == "xtunnel":
+            helperDisableAutoProxy(currentService)
+            helperEnableXTunnelProxy(currentService)
         elif proxy_setting == "disable":
             helperDisableAutoProxy(currentService)
             helperDisableGlobalProxy(currentService)

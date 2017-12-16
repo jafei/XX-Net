@@ -1,7 +1,6 @@
 
 import os
 import sys
-import urllib2
 import time
 import subprocess
 import threading
@@ -9,7 +8,6 @@ import re
 import zipfile
 import shutil
 import stat
-import ssl
 
 current_path = os.path.dirname(os.path.abspath(__file__))
 root_path = os.path.abspath( os.path.join(current_path, os.pardir))
@@ -19,7 +17,9 @@ python_path = os.path.join(root_path, 'python27', '1.0')
 noarch_lib = os.path.join(python_path, 'lib', 'noarch')
 sys.path.append(noarch_lib)
 
-from instances import xlog
+import simple_http_client
+from xlog import getLogger
+xlog = getLogger("launcher")
 import config
 import update
 
@@ -33,13 +33,44 @@ if not os.path.isdir(download_path):
 
 progress = {} # link => {"size", 'downloaded', status:downloading|canceled|finished:failed}
 progress["update_status"] = "Idle"
+update_info = "init"
 
-def get_opener(retry=0):
+def init_update_info(check_update):
+    global update_info
+    if check_update == "dont-check":
+        update_info = "dont-check"
+    elif config.get(["update", "check_update"]) == update_info == "dont-check":
+        update_info = "init"
+    elif check_update != "init":
+        update_info = ""
+
+init_update_info(config.get(["update", "check_update"]))
+
+
+def request(url, retry=0, timeout=30):
     if retry == 0:
-        opener = urllib2.build_opener()
-        return opener
+        if int(config.get(["proxy", "enable"], 0)):
+            client = simple_http_client.Client(proxy={
+                "type": config.get(["proxy", "type"], ""),
+                "host": config.get(["proxy", "host"], ""),
+                "port": int(config.get(["proxy", "port"], 0)),
+                "user": config.get(["proxy", "user"], ""),
+                "pass": config.get(["proxy", "passwd"], ""),
+            }, timeout=timeout)
+        else:
+            client = simple_http_client.Client(timeout=timeout)
     else:
-        return update.get_opener()
+        cert = os.path.join(data_root, "gae_proxy", "CA.crt")
+        client = simple_http_client.Client(proxy={
+            "type": "http",
+            "host": "127.0.0.1",
+            "port": 8087,
+            "user": None,
+            "pass": None
+        }, timeout=timeout, cert=cert)
+
+    res = client.request("GET", url, read_payload=False)
+    return res
 
 
 def download_file(url, filename):
@@ -56,20 +87,52 @@ def download_file(url, filename):
     for i in range(0, 2):
         try:
             xlog.info("download %s to %s, retry:%d", url, filename, i)
-            opener = get_opener(i)
-            req = opener.open(url, timeout=30)
-            progress[url]["size"] = int(req.headers.get('content-length') or 0)
+            req = request(url, i, timeout=120)
+            if not req:
+                continue
 
-            chunk_len = 65536
-            downloaded = 0
-            with open(filename, 'wb') as fp:
-                while True:
-                    chunk = req.read(chunk_len)
-                    if not chunk:
-                        break
-                    fp.write(chunk)
-                    downloaded += len(chunk)
-                    progress[url]["downloaded"] = downloaded
+            start_time = time.time()
+            timeout = 300
+
+            if req.chunked:
+                # don't known the file size, set to large for show the progress
+                progress[url]["size"] = 20 * 1024 * 1024
+
+                downloaded = 0
+                with open(filename, 'wb') as fp:
+                    while True:
+                        time_left = timeout - (time.time() - start_time)
+                        if time_left < 0:
+                            raise Exception("time out")
+
+                        dat = req.read(timeout=time_left)
+                        if not dat:
+                            break
+
+                        fp.write(dat)
+                        downloaded += len(dat)
+                        progress[url]["downloaded"] = downloaded
+
+                progress[url]["status"] = "finished"
+                return True
+            else:
+                file_size = progress[url]["size"] = int(req.getheader('Content-Length', 0))
+
+                left = file_size
+                downloaded = 0
+                with open(filename, 'wb') as fp:
+                    while True:
+                        chunk_len = min(65536, left)
+                        if not chunk_len:
+                            break
+
+                        chunk = req.read(chunk_len)
+                        if not chunk:
+                            break
+                        fp.write(chunk)
+                        downloaded += len(chunk)
+                        progress[url]["downloaded"] = downloaded
+                        left -= len(chunk)
 
             if downloaded != progress[url]["size"]:
                 xlog.warn("download size:%d, need size:%d, download fail.", downloaded, progress[url]["size"])
@@ -77,9 +140,6 @@ def download_file(url, filename):
             else:
                 progress[url]["status"] = "finished"
                 return True
-        except (urllib2.URLError, ssl.SSLError) as e:
-            xlog.warn("download %s to %s URL fail:%r", url, filename, e)
-            continue
         except Exception as e:
             xlog.exception("download %s to %s fail:%r", url, filename, e)
             continue
@@ -202,7 +262,7 @@ def overwrite(xxnet_version, xxnet_unzip_path):
     xlog.info("update file finished.")
 
 
-def download_overwrite_new_version(xxnet_version):
+def download_overwrite_new_version(xxnet_version,checkhash=1):
     global update_progress
 
     xxnet_url = 'https://codeload.github.com/XX-net/XX-Net/zip/%s' % xxnet_version
@@ -214,10 +274,14 @@ def download_overwrite_new_version(xxnet_version):
         progress["update_status"] = "Download Fail."
         raise Exception("download xxnet zip fail:%s" % xxnet_zip_file)
 
-    hash_sum = get_hash_sum(xxnet_version)
-    if len(hash_sum) and hash_file_sum(xxnet_zip_file) != hash_sum:
-        progress["update_status"] = "Download Checksum Fail."
-        raise Exception("download xxnet zip checksum fail:%s" % xxnet_zip_file)
+    if checkhash:
+        hash_sum = get_hash_sum(xxnet_version)
+        if len(hash_sum) and hash_file_sum(xxnet_zip_file) != hash_sum:
+            progress["update_status"] = "Download Checksum Fail."
+            xlog.warn("downloaded xxnet zip checksum fail:%s" % xxnet_zip_file)
+            raise Exception("downloaded xxnet zip checksum fail:%s" % xxnet_zip_file)
+    else:
+        xlog.debug("skip checking downloaded file hash")
 
     xlog.info("update download %s finished.", download_path)
 
@@ -239,29 +303,49 @@ def download_overwrite_new_version(xxnet_version):
     shutil.rmtree(xxnet_unzip_path, ignore_errors=True)
 
 
-def update_current_version(xxnet_version):
+def update_current_version(version):
+    start_script = os.path.join(top_path, "code", version, "launcher", "start.py")
+    if not os.path.isfile(start_script):
+        xlog.warn("set version %s not exist", version)
+        return False
+
     current_version_file = os.path.join(top_path, "code", "version.txt")
     with open(current_version_file, "w") as fd:
-        fd.write(xxnet_version)
+        fd.write(version)
+    return True
 
 
-def restart_xxnet(version):
+def restart_xxnet(version=None):
     import module_init
     module_init.stop_all()
+
     import web_control
     web_control.stop()
+    # New process will hold the listen port
+    # We should close all listen port before create new process
+    xlog.info("Close web control port.")
+
+    if version is None:
+        current_version_file = os.path.join(top_path, "code", "version.txt")
+        with open(current_version_file, "r") as fd:
+            version = fd.read()
+
+    xlog.info("restart to xx-net version:%s", version)
 
     start_script = os.path.join(top_path, "code", version, "launcher", "start.py")
-
     subprocess.Popen([sys.executable, start_script])
     time.sleep(20)
-    #os._exit(0)
+
+    xlog.info("Exit old process...")
+    os._exit(0)
 
 
-def update_version(version):
-    global update_progress
+def update_version(version,checkhash=1):
+    global update_progress, update_info
+    _update_info = update_info
+    update_info = ""
     try:
-        download_overwrite_new_version(version)
+        download_overwrite_new_version(version,checkhash)
 
         update_current_version(version)
 
@@ -270,14 +354,15 @@ def update_version(version):
         restart_xxnet(version)
     except Exception as e:
         xlog.warn("update version %s fail:%r", version, e)
+        update_info = _update_info
 
 
-def start_update_version(version):
+def start_update_version(version, checkhash=1):
     if progress["update_status"] != "Idle" and "Fail" not in progress["update_status"]:
         return progress["update_status"]
 
     progress["update_status"] = "Start update"
-    th = threading.Thread(target=update_version, args=(version,))
+    th = threading.Thread(target=update_version, args=(version,checkhash))
     th.start()
     return True
 
