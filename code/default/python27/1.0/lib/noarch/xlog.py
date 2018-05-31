@@ -9,6 +9,8 @@ import json
 import shutil
 import types
 
+reload(sys)
+sys.setdefaultencoding('utf8')
 
 CRITICAL = 50
 FATAL = CRITICAL
@@ -227,6 +229,21 @@ class Logger():
             print("line can't decode:%s" % line)
             print("Except stack:%s" % traceback.format_exc())
             return ""
+
+
+class null():
+    @staticmethod
+    def debug(fmt, *args, **kwargs):
+        pass
+    @staticmethod
+    def info(fmt, *args, **kwargs):
+        pass
+    @staticmethod
+    def warn(fmt, *args, **kwargs):
+        pass
+    @staticmethod
+    def exception(fmt, *args, **kwargs):
+        pass
 
 
 loggerDict = {}
